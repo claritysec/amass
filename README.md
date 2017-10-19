@@ -38,7 +38,7 @@ $ amass -v example.com
 www.example.com
 ns.example.com
 ...
-865 names discovered - search: 820 numflip: 35 archive: 7 dns: 3
+13242 names discovered - search: 211, dns: 4709, archive: 126, shodan: 169, numflip: 8027
 ```
 
 
