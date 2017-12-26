@@ -5,55 +5,51 @@ package amass
 
 import (
 	"fmt"
+	"io/ioutil"
+	"net/http"
 	"net/url"
 	"regexp"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
+
+	"github.com/PuerkitoBio/gocrawl"
+	"github.com/PuerkitoBio/goquery"
 )
 
-const NUM_SEARCHES int = 9
+const NUM_SEARCHES int = 11
 
+// Searcher - represents all objects that perform searches for domain names
+type Searcher interface {
+	Search(domain string, done chan int)
+	fmt.Stringer
+}
+
+// searchEngine - A searcher that attempts to discover information using a web search engine
 type searchEngine struct {
 	name       string
-	domain     string
 	quantity   int
 	limit      int
 	subdomains chan *Subdomain
-	callback   func(searchEngine, int) string
+	callback   func(*searchEngine, string, int) string
 }
 
-func (se searchEngine) String() string {
+func (se *searchEngine) String() string {
 	return se.name
 }
 
-func (se searchEngine) Domain() string {
-	return se.domain
+func (se *searchEngine) urlByPageNum(domain string, page int) string {
+	return se.callback(se, domain, page)
 }
 
-func (se searchEngine) Quantity() int {
-	return se.quantity
-}
-
-func (se searchEngine) Limit() int {
-	return se.limit
-}
-
-func (se searchEngine) URLByPageNum(page int) string {
-	return se.callback(se, page)
-}
-
-func (se searchEngine) Search(done chan int) {
+func (se *searchEngine) Search(domain string, done chan int) {
 	var unique []string
 
-	re, err := regexp.Compile(SUBRE + se.Domain())
-	if err != nil {
-		done <- 0
-		return
-	}
-
-	num := se.Limit() / se.Quantity()
+	re := SubdomainRegex(domain)
+	num := se.limit / se.quantity
 	for i := 0; i < num; i++ {
-		page := GetWebPage(se.URLByPageNum(i))
+		page := GetWebPage(se.urlByPageNum(domain, i))
 		if page == "" {
 			break
 		}
@@ -63,138 +59,93 @@ func (se searchEngine) Search(done chan int) {
 
 			if len(u) > 0 {
 				unique = append(unique, u...)
-				se.subdomains <- &Subdomain{Name: sd, Domain: se.Domain(), Tag: SEARCH}
+				se.subdomains <- &Subdomain{Name: sd, Domain: domain, Tag: SEARCH}
 			}
 		}
 
 		time.Sleep(1 * time.Second)
 	}
-
 	done <- len(unique)
 	return
 }
 
-func askURLByPageNum(a searchEngine, page int) string {
+func askURLByPageNum(a *searchEngine, domain string, page int) string {
 	pu := strconv.Itoa(a.quantity)
 	p := strconv.Itoa(page)
-
 	u, _ := url.Parse("http://www.ask.com/web")
-	u.RawQuery = url.Values{"q": {a.domain}, "pu": {pu}, "page": {p}}.Encode()
 
+	u.RawQuery = url.Values{"q": {domain}, "pu": {pu}, "page": {p}}.Encode()
 	return u.String()
 }
 
-func AskSearch(domain string, subdomains chan *Subdomain) Searcher {
-	a := new(searchEngine)
+func (a *Amass) AskSearch() Searcher {
+	as := new(searchEngine)
 
-	a.name = "Ask Search"
-	a.domain = domain
+	as.name = "Ask Search"
 	// ask.com appears to be hardcoded at 10 results per page
-	a.quantity = 10
-	a.limit = 200
-	a.subdomains = subdomains
-	a.callback = askURLByPageNum
-	return a
+	as.quantity = 10
+	as.limit = 200
+	as.subdomains = a.Names
+	as.callback = askURLByPageNum
+	return as
 }
 
-func bingURLByPageNum(b searchEngine, page int) string {
+func bingURLByPageNum(b *searchEngine, domain string, page int) string {
 	count := strconv.Itoa(b.quantity)
 	first := strconv.Itoa((page * b.quantity) + 1)
-
 	u, _ := url.Parse("http://www.bing.com/search")
-	u.RawQuery = url.Values{"q": {"domain:" + b.domain},
-		"count": {count}, "first": {first}, "FORM": {"PORE"}}.Encode()
 
+	u.RawQuery = url.Values{"q": {"domain:" + domain},
+		"count": {count}, "first": {first}, "FORM": {"PORE"}}.Encode()
 	return u.String()
 }
 
-func BingSearch(domain string, subdomains chan *Subdomain) Searcher {
+func (a *Amass) BingSearch() Searcher {
 	b := new(searchEngine)
 
 	b.name = "Bing Search"
-	b.domain = domain
 	b.quantity = 20
 	b.limit = 400
-	b.subdomains = subdomains
+	b.subdomains = a.Names
 	b.callback = bingURLByPageNum
 	return b
 }
 
-func censysURLByPageNum(c searchEngine, page int) string {
-	format := "https://www.censys.io/domain/%s/table"
-
-	return fmt.Sprintf(format, c.domain)
-}
-
-func CensysSearch(domain string, subdomains chan *Subdomain) Searcher {
-	c := new(searchEngine)
-
-	c.name = "Censys Search"
-	c.domain = domain
-	c.quantity = 1
-	c.limit = 1
-	c.subdomains = subdomains
-	c.callback = censysURLByPageNum
-	return c
-}
-
-func crtshURLByPageNum(c searchEngine, page int) string {
-	u, _ := url.Parse("https://crt.sh/")
-	u.RawQuery = url.Values{"q": {"%25" + c.domain}}.Encode()
-
-	return u.String()
-}
-
-func CrtshSearch(domain string, subdomains chan *Subdomain) Searcher {
-	c := new(searchEngine)
-
-	c.name = "Crtsh Search"
-	c.domain = domain
-	c.quantity = 1
-	c.limit = 1
-	c.subdomains = subdomains
-	c.callback = crtshURLByPageNum
-	return c
-}
-
-func dogpileURLByPageNum(d searchEngine, page int) string {
+func dogpileURLByPageNum(d *searchEngine, domain string, page int) string {
 	qsi := strconv.Itoa(d.quantity * page)
 
 	u, _ := url.Parse("http://www.dogpile.com/search/web")
-	u.RawQuery = url.Values{"qsi": {qsi}, "q": {"\"" + d.domain + "\""}}.Encode()
-
+	u.RawQuery = url.Values{"qsi": {qsi}, "q": {"\"" + domain + "\""}}.Encode()
 	return u.String()
 }
 
-func DogpileSearch(domain string, subdomains chan *Subdomain) Searcher {
+func (a *Amass) DogpileSearch() Searcher {
 	d := new(searchEngine)
 
 	d.name = "Dogpile Search"
-	d.domain = domain
 	// Dogpile returns roughly 15 results per page
 	d.quantity = 15
 	d.limit = 300
-	d.subdomains = subdomains
+	d.subdomains = a.Names
 	d.callback = dogpileURLByPageNum
 	return d
 }
 
-func gigablastURLByPageNum(g searchEngine, page int) string {
+func gigablastURLByPageNum(g *searchEngine, domain string, page int) string {
 	s := strconv.Itoa(g.quantity * page)
 
 	u, _ := url.Parse("http://www.gigablast.com/search")
-	u.RawQuery = url.Values{"q": {g.domain}, "niceness": {"1"},
+	u.RawQuery = url.Values{"q": {domain}, "niceness": {"1"},
 		"icc": {"1"}, "dr": {"1"}, "spell": {"0"}, "s": {s}}.Encode()
 
 	return u.String()
 }
 
-func GigablastSearch(domain string, subdomains chan *Subdomain) Searcher {
+func (a *Amass) GigablastSearch() Searcher {
 	g := new(searchEngine)
 
 	g.name = "Gigablast Search"
-	g.domain = domain
-	g.subdomains = subdomains
+	g.subdomains = a.Names
 	// Gigablast.com appears to be hardcoded at 10 results per page
 	g.quantity = 10
 	g.limit = 200
@@ -202,61 +153,247 @@ func GigablastSearch(domain string, subdomains chan *Subdomain) Searcher {
 	return g
 }
 
-func pgpURLByPageNum(p searchEngine, page int) string {
-	u, _ := url.Parse("http://pgp.mit.edu/pks/lookup")
-	u.RawQuery = url.Values{"search": {p.domain}, "op": {"index"}}.Encode()
-
-	return u.String()
-}
-
-func PGPSearch(domain string, subdomains chan *Subdomain) Searcher {
-	p := new(searchEngine)
-
-	p.name = "PGP Search"
-	p.domain = domain
-	p.quantity = 1
-	p.limit = 1
-	p.subdomains = subdomains
-	p.callback = pgpURLByPageNum
-	return p
-}
-
-func robtexURLByPageNum(r searchEngine, page int) string {
-	format := "https://www.robtex.com/dns-lookup/%s"
-
-	return fmt.Sprintf(format, r.domain)
-}
-
-func RobtexSearch(domain string, subdomains chan *Subdomain) Searcher {
-	r := new(searchEngine)
-
-	r.name = "Robtex Search"
-	r.domain = domain
-	r.quantity = 1
-	r.limit = 1
-	r.subdomains = subdomains
-	r.callback = robtexURLByPageNum
-	return r
-}
-
-func yahooURLByPageNum(y searchEngine, page int) string {
+func yahooURLByPageNum(y *searchEngine, domain string, page int) string {
 	b := strconv.Itoa(y.quantity * page)
 	pz := strconv.Itoa(y.quantity)
 
 	u, _ := url.Parse("http://search.yahoo.com/search")
-	u.RawQuery = url.Values{"p": {"\"" + y.domain + "\""}, "b": {b}, "pz": {pz}}.Encode()
+	u.RawQuery = url.Values{"p": {"\"" + domain + "\""}, "b": {b}, "pz": {pz}}.Encode()
 
 	return u.String()
 }
 
-func YahooSearch(domain string, subdomains chan *Subdomain) Searcher {
+func (a *Amass) YahooSearch() Searcher {
 	y := new(searchEngine)
 
 	y.name = "Yahoo Search"
-	y.domain = domain
 	y.quantity = 20
 	y.limit = 400
-	y.subdomains = subdomains
+	y.subdomains = a.Names
 	y.callback = yahooURLByPageNum
 	return y
+}
+
+//--------------------------------------------------------------------------------------------
+// lookup - A searcher that attempts to discover information on a single web page
+type lookup struct {
+	name       string
+	subdomains chan *Subdomain
+	callback   func(string) string
+}
+
+func (l *lookup) String() string {
+	return l.name
+}
+
+func (l *lookup) Search(domain string, done chan int) {
+	var unique []string
+
+	re := SubdomainRegex(domain)
+	page := GetWebPage(l.callback(domain))
+	if page == "" {
+		done <- 0
+		return
+	}
+
+	for _, sd := range re.FindAllString(page, -1) {
+		u := NewUniqueElements(unique, sd)
+
+		if len(u) > 0 {
+			unique = append(unique, u...)
+			l.subdomains <- &Subdomain{Name: sd, Domain: domain, Tag: SEARCH}
+		}
+	}
+
+	done <- len(unique)
+	return
+}
+
+func censysURL(domain string) string {
+	format := "https://www.censys.io/domain/%s/table"
+
+	return fmt.Sprintf(format, domain)
+}
+
+func (a *Amass) CensysSearch() Searcher {
+	c := new(lookup)
+
+	c.name = "Censys Search"
+	c.subdomains = a.Names
+	c.callback = censysURL
+	return c
+}
+
+func netcraftURL(domain string) string {
+	format := "https://searchdns.netcraft.com/?restriction=site+ends+with&host=%s"
+
+	return fmt.Sprintf(format, domain)
+}
+
+func (a *Amass) NetcraftSearch() Searcher {
+	n := new(lookup)
+
+	n.name = "Netcraft Search"
+	n.subdomains = a.Names
+	n.callback = netcraftURL
+	return n
+}
+
+func pgpURL(domain string) string {
+	u, _ := url.Parse("http://pgp.mit.edu/pks/lookup")
+	u.RawQuery = url.Values{"search": {domain}, "op": {"index"}}.Encode()
+
+	return u.String()
+}
+
+func (a *Amass) PGPSearch() Searcher {
+	p := new(lookup)
+
+	p.name = "PGP Search"
+	p.subdomains = a.Names
+	p.callback = pgpURL
+	return p
+}
+
+func robtexURL(domain string) string {
+	format := "https://www.robtex.com/dns-lookup/%s"
+
+	return fmt.Sprintf(format, domain)
+}
+
+func (a *Amass) RobtexSearch() Searcher {
+	r := new(lookup)
+
+	r.name = "Robtex Search"
+	r.subdomains = a.Names
+	r.callback = robtexURL
+	return r
+}
+
+func virusTotalURL(domain string) string {
+	format := "https://www.virustotal.com/en/domain/%s/information/"
+
+	return fmt.Sprintf(format, domain)
+}
+
+func (a *Amass) VirusTotalSearch() Searcher {
+	vt := new(lookup)
+
+	vt.name = "VirusTotal Search"
+	vt.subdomains = a.Names
+	vt.callback = virusTotalURL
+	return vt
+}
+
+//--------------------------------------------------------------------------------------------
+// crtshCrawl - A searcher that attempts to discover names from SSL certificates
+type crtshCrawl struct {
+	name       string
+	subdomains chan *Subdomain
+}
+
+func (a *Amass) CrtshSearch() Searcher {
+	c := new(crtshCrawl)
+
+	c.name = "Crtsh Search"
+	c.subdomains = a.Names
+	return c
+}
+
+func (c *crtshCrawl) String() string {
+	return c.name
+}
+
+func (c *crtshCrawl) Search(domain string, done chan int) {
+	url := "https://crt.sh/?q=" + domain
+
+	ctCrawl(url, "crt.sh", domain, c.subdomains, 30*time.Second)
+	done <- 1
+}
+
+type ctExt struct {
+	*gocrawl.DefaultExtender
+	re              *regexp.Regexp
+	filter          map[string]bool
+	flock           sync.RWMutex
+	service, domain string
+	names           chan *Subdomain
+}
+
+func (e *ctExt) Log(logFlags gocrawl.LogFlags, msgLevel gocrawl.LogFlags, msg string) {
+	return
+}
+
+func (e *ctExt) RequestRobots(ctx *gocrawl.URLContext, robotAgent string) (data []byte, doRequest bool) {
+	return nil, false
+}
+
+func (e *ctExt) Filter(ctx *gocrawl.URLContext, isVisited bool) bool {
+	if isVisited {
+		return false
+	}
+
+	u := ctx.URL().String()
+
+	if !strings.Contains(u, e.service) {
+		return false
+	}
+
+	e.flock.RLock()
+	_, ok := e.filter[u]
+	e.flock.RUnlock()
+
+	if ok {
+		return false
+	}
+
+	e.flock.Lock()
+	e.filter[u] = true
+	e.flock.Unlock()
+	return true
+}
+
+func (e *ctExt) Visit(ctx *gocrawl.URLContext, res *http.Response, doc *goquery.Document) (interface{}, bool) {
+	in, err := ioutil.ReadAll(res.Body)
+	if err == nil {
+		for _, sd := range e.re.FindAllString(string(in), -1) {
+			e.names <- &Subdomain{Name: sd, Domain: e.domain, Tag: SEARCH}
+		}
+	}
+	return nil, true
+}
+
+func ctCrawl(url, service, domain string, names chan *Subdomain, timeout time.Duration) {
+	ext := &ctExt{
+		DefaultExtender: &gocrawl.DefaultExtender{},
+		re:              SubdomainRegex(domain),
+		filter:          make(map[string]bool), // filter for not double-checking URLs
+		service:         service,
+		domain:          domain,
+		names:           names,
+	}
+
+	// Set custom options
+	opts := gocrawl.NewOptions(ext)
+	opts.CrawlDelay = 50 * time.Millisecond
+	opts.LogFlags = gocrawl.LogError
+	opts.SameHostOnly = true
+	opts.MaxVisits = 200
+
+	c := gocrawl.NewCrawlerWithOptions(opts)
+	go c.Run(url)
+
+	<-time.After(timeout)
+	c.Stop()
+}
+
+func GetWebPage(url string) string {
+	resp, err := http.Get(url)
+	if err != nil {
+		return ""
+	}
+
+	in, err := ioutil.ReadAll(resp.Body)
+	resp.Body.Close()
+	return string(in)
 }
