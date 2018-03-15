@@ -4,14 +4,16 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
+	"io"
+	"io/ioutil"
+	"math/rand"
 	"os"
 	"os/signal"
 	"path"
-	"regexp"
-	"strings"
-	"sync"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -35,30 +37,46 @@ var AsciiArt string = `
         +o&&&&+.                                                    +oooo.                          
 
                                                   Subdomain Enumeration Tool
-                                                       Created by Jeff Foley
+                                           Coded By Jeff Foley (@jeff_foley)
 
 `
 
+type outputParams struct {
+	Verbose  bool
+	Sources  bool
+	PrintIPs bool
+	FileOut  string
+	Results  chan *amass.AmassRequest
+	Finish   chan struct{}
+	Done     chan struct{}
+}
+
 func main() {
 	var freq int64
-	var count int
-	var wordlist string
-	var config amass.AmassConfig
-	var show, ip, whois, list, help bool
+	var wordlist, file string
+	var verbose, extra, ip, brute, recursive, whois, list, help bool
 
 	flag.BoolVar(&help, "h", false, "Show the program usage message")
 	flag.BoolVar(&ip, "ip", false, "Show the IP addresses for discovered names")
-	flag.BoolVar(&show, "v", false, "Print the summary information")
+	flag.BoolVar(&brute, "brute", false, "Execute brute forcing after searches")
+	flag.BoolVar(&recursive, "norecursive", true, "Turn off recursive brute forcing")
+	flag.BoolVar(&verbose, "v", false, "Print the summary information")
+	flag.BoolVar(&extra, "vv", false, "Print the data source information")
 	flag.BoolVar(&whois, "whois", false, "Include domains discoverd with reverse whois")
-	flag.BoolVar(&list, "list", false, "List all domains to be used in the search")
+	flag.BoolVar(&list, "l", false, "List all domains to be used in an enumeration")
 	flag.Int64Var(&freq, "freq", 0, "Sets the number of max DNS queries per minute")
-	flag.StringVar(&wordlist, "words", "", "Path to the wordlist file")
+	flag.StringVar(&wordlist, "w", "", "Path to a different wordlist file")
+	flag.StringVar(&file, "o", "", "Path to the output file")
 	flag.Parse()
+
+	if extra {
+		verbose = true
+	}
 
 	domains := flag.Args()
 	if help || len(domains) == 0 {
 		fmt.Println(AsciiArt)
-		fmt.Printf("Usage: %s [options] domain extra_domain1 extra_domain2... (e.g. google.com)\n", path.Base(os.Args[0]))
+		fmt.Printf("Usage: %s [options] domain domain2 domain3... (e.g. example.com)\n", path.Base(os.Args[0]))
 		flag.PrintDefaults()
 		return
 	}
@@ -76,227 +94,183 @@ func main() {
 		return
 	}
 
-	var err error
-	// Add the frequency to the configuration
-	config.Frequency = freqToDuration(freq)
-	// If provided, add the word list to the config
+	// Seed the default pseudo-random number generator
+	rand.Seed(time.Now().UTC().UnixNano())
+
+	finish := make(chan struct{})
+	done := make(chan struct{})
+	results := make(chan *amass.AmassRequest, 100)
+
+	go manageOutput(&outputParams{
+		Verbose:  verbose,
+		Sources:  extra,
+		PrintIPs: ip,
+		FileOut:  file,
+		Results:  results,
+		Finish:   finish,
+		Done:     done,
+	})
+	// Execute the signal handler
+	go catchSignals(finish, done)
+	// Grab the words from an identified wordlist
+	var words []string
 	if wordlist != "" {
-		// Open the wordlist
-		config.Wordlist, err = os.Open(wordlist)
-		if err != nil {
-			fmt.Printf("Error opening the wordlist file: %v\n", err)
-			return
-		}
-		defer config.Wordlist.Close()
+		words = getWordlist(wordlist)
 	}
-
-	stats := make(map[string]int)
-	names := make(chan *amass.Subdomain, 100)
-	// Collect all the names returned by the enumeration
-	go func() {
-		for {
-			name := <-names
-
-			count++
-			stats[name.Tag]++
-			if ip {
-				fmt.Println(name.Name + "," + name.Address)
-			} else {
-				fmt.Println(name.Name)
-			}
-
-		}
-	}()
-
-	// If the user interrupts the program, print the summary information
-	sigs := make(chan os.Signal, 2)
-	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-sigs
-
-		if show {
-			printResults(count, stats)
-		}
-
-		os.Exit(0)
-	}()
-
-	// Fire off the driver function for enumeration
-	enumeration(domains, names, config)
-
-	if show {
-		// Print the summary information
-		printResults(count, stats)
-	}
+	// Setup the amass configuration
+	config := amass.CustomConfig(&amass.AmassConfig{
+		Domains:      domains,
+		Wordlist:     words,
+		BruteForcing: brute,
+		Recursive:    recursive,
+		Frequency:    freqToDuration(freq),
+		Output:       results,
+	})
+	// Begin the enumeration process
+	amass.StartAmass(config)
+	// Signal for output to finish
+	finish <- struct{}{}
+	<-done
 }
 
-// PrintResults - Prints the summary information for the enumeration
-func printResults(total int, stats map[string]int) {
-	count := 1
-	length := len(stats)
-
-	fmt.Printf("\n%d names discovered - ", total)
-
-	for k, v := range stats {
-		if count < length {
-			fmt.Printf("%s: %d, ", k, v)
-		} else {
-			fmt.Printf("%s: %d\n", k, v)
-		}
-		count++
-	}
-	return
+type asnData struct {
+	Name      string
+	Netblocks map[string]int
 }
 
-// This is the driver function that performs a complete enumeration.
-func enumeration(domains []string, names chan *amass.Subdomain, config amass.AmassConfig) {
-	var activity bool
-	var completed int
-	var filterLock sync.Mutex
+func manageOutput(params *outputParams) {
+	var total int
+	var allLines string
 
-	done := make(chan int, 20)
-	a := amass.NewAmassWithConfig(config)
-	totalSearches := amass.NUM_SEARCHES * len(domains)
-	// Start the simple searches to get us started
-	startSearches(domains, a, done)
-	// Get all the archives to be used
-	archives := getArchives(a)
-	// When this timer fires, the program will end
-	t := time.NewTimer(30 * time.Second)
-	defer t.Stop()
-	// Filter for not double-checking subdomain names
-	filterNames := make(map[string]struct{})
-	// Filter for not double-checking IP addresses
-	filterRDNS := make(map[string]struct{})
-	filter := func(ip string) bool {
-		filterLock.Lock()
-		defer filterLock.Unlock()
-
-		if _, ok := filterRDNS[ip]; ok {
-			return true
-		}
-		filterRDNS[ip] = struct{}{}
-		return false
-	}
-	// Make sure resolved names are not provided to the user more than once
-	legitimate := make(map[string]struct{})
-	// Start brute forcing
-	go a.BruteForce(domains)
+	tags := make(map[string]int)
+	asns := make(map[int]*asnData)
 loop:
 	for {
 		select {
-		case sd := <-a.Names: // New subdomains come in here
-			sd.Name = trim252F(sd.Name)
+		case result := <-params.Results: // Collect all the names returned by the enumeration
+			total++
+			updateData(result, tags, asns)
 
-			if sd.Name != "" {
-				if _, ok := filterNames[sd.Name]; !ok {
-					filterNames[sd.Name] = struct{}{}
-
-					if sd.Domain == "" {
-						sd.Domain = getDomainFromName(sd.Name, domains)
-					}
-
-					if sd.Domain != "" {
-						// Is this new name valid?
-						a.AddDNSRequest(sd)
-					}
-				}
+			var line string
+			if params.Sources {
+				line += fmt.Sprintf("%-14s", "["+result.Source+"] ")
 			}
-			activity = true
-		case r := <-a.Resolved: // Names that have been resolved via dns lookup
-			r.Name = trim252F(r.Name)
-
-			if _, ok := legitimate[r.Name]; !ok {
-				legitimate[r.Name] = struct{}{}
-
-				a.AttemptSweep(r.Domain, r.Address, filter)
-				// Give it to the user!
-				names <- r
-				// Check if this subdomain/host name has an archived web page
-				for _, ar := range archives {
-					ar.CheckHistory(r)
-				}
-				// Try altering the names to create new names
-				a.ExecuteAlterations(r)
+			if params.PrintIPs {
+				line += fmt.Sprintf("%s\n", result.Name+","+result.Address)
+			} else {
+				line += fmt.Sprintf("%s\n", result.Name)
 			}
-			activity = true
-		case <-done: // Searches that have finished
-			completed++
-		case <-t.C: // Periodic checks happen in here
-			if !activity && completed == totalSearches && a.DNSRequestQueueEmpty() {
-				// We are done if searches are finished, no dns queries left, and no activity
-				break loop
+
+			// Add line to the others and print it out
+			allLines += line
+			fmt.Print(line)
+		case <-params.Finish:
+			break loop
+		}
+	}
+	// Check to print the summary information
+	if params.Verbose {
+		printSummary(total, tags, asns)
+	}
+	// Check to output the results to a file
+	if params.FileOut != "" {
+		ioutil.WriteFile(params.FileOut, []byte(allLines), 0644)
+	}
+	// Signal that output is complete
+	close(params.Done)
+}
+
+func updateData(req *amass.AmassRequest, tags map[string]int, asns map[int]*asnData) {
+	tags[req.Tag]++
+
+	// Update the ASN information
+	data, found := asns[req.ASN]
+	if !found {
+		asns[req.ASN] = &asnData{
+			Name:      req.ISP,
+			Netblocks: make(map[string]int),
+		}
+		data = asns[req.ASN]
+	}
+	// Increment how many IPs were in this netblock
+	data.Netblocks[req.Netblock.String()]++
+}
+
+func printSummary(total int, tags map[string]int, asns map[int]*asnData) {
+	fmt.Printf("\n%d names discovered - ", total)
+
+	// Print the stats using tag information
+	num, length := 1, len(tags)
+	for k, v := range tags {
+		fmt.Printf("%s: %d", k, v)
+		if num < length {
+			fmt.Print(", ")
+		}
+		num++
+	}
+	fmt.Println("")
+
+	// Print a line across the terminal
+	for i := 0; i < 8; i++ {
+		fmt.Print("----------")
+	}
+	fmt.Println("")
+
+	// Print the ASN and netblock information
+	for asn, data := range asns {
+		fmt.Printf("ASN: %d - %s\n", asn, data.Name)
+
+		for cidr, ips := range data.Netblocks {
+			s := strconv.Itoa(ips)
+
+			fmt.Printf("\t%-18s\t%-3s ", cidr, s)
+			if ips == 1 {
+				fmt.Println("IP address")
+			} else {
+				fmt.Println("IP addresses")
 			}
-			// Otherwise, keep the process going
-			t.Reset(5 * time.Second)
-			activity = false
 		}
 	}
 }
 
-func startSearches(domains []string, a *amass.Amass, done chan int) {
-	searches := []amass.Searcher{
-		a.PGPSearch(),
-		a.AskSearch(),
-		a.CensysSearch(),
-		a.CrtshSearch(),
-		a.NetcraftSearch(),
-		a.RobtexSearch(),
-		a.BingSearch(),
-		a.DogpileSearch(),
-		a.YahooSearch(),
-		a.GigablastSearch(),
-		a.VirusTotalSearch(),
-	}
+// If the user interrupts the program, print the summary information
+func catchSignals(output, done chan struct{}) {
+	sigs := make(chan os.Signal, 2)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
 
-	// Fire off the searches
-	for _, d := range domains {
-		for _, s := range searches {
-			go s.Search(d, done)
-		}
-	}
+	// Wait for a signal
+	<-sigs
+	// Start final output operations
+	output <- struct{}{}
+	// Wait for the broadcast indicating completion
+	<-done
+	os.Exit(0)
 }
 
-func getArchives(a *amass.Amass) []amass.Archiver {
-	archives := []amass.Archiver{
-		a.WaybackMachineArchive(),
-		a.LibraryCongressArchive(),
-		a.ArchiveIsArchive(),
-		a.ArchiveItArchive(),
-		a.ArquivoArchive(),
-		a.BayerischeArchive(),
-		a.PermaArchive(),
-		a.UKWebArchive(),
-		a.UKGovArchive(),
-	}
-	return archives
-}
+func getWordlist(path string) []string {
+	var list []string
+	var wordlist io.Reader
 
-func getDomainFromName(name string, domains []string) string {
-	var result string
-
-	for _, d := range domains {
-		if strings.HasSuffix(name, d) {
-			result = d
-			break
-		}
-	}
-	return result
-}
-
-func trim252F(subdomain string) string {
-	s := strings.ToLower(subdomain)
-
-	re, err := regexp.Compile("^((252f)|(2f)|(3d))+")
+	// Open the wordlist
+	file, err := os.Open(path)
 	if err != nil {
-		return s
+		fmt.Printf("Error opening the wordlist file: %v\n", err)
+		return list
 	}
+	defer file.Close()
+	wordlist = file
 
-	i := re.FindStringIndex(s)
-	if i != nil {
-		return s[i[1]:]
+	scanner := bufio.NewScanner(wordlist)
+	// Once we have used all the words, we are finished
+	for scanner.Scan() {
+		// Get the next word in the list
+		word := scanner.Text()
+		if word != "" {
+			// Add the word to the list
+			list = append(list, word)
+		}
 	}
-	return s
+	return list
 }
 
 func freqToDuration(freq int64) time.Duration {
@@ -304,18 +278,16 @@ func freqToDuration(freq int64) time.Duration {
 		d := time.Duration(freq)
 
 		if d < 60 {
-			// we are dealing with number of seconds
+			// We are dealing with number of seconds
 			return (60 / d) * time.Second
 		}
-
-		// make it times per second
+		// Make it times per second
 		d = d / 60
-
 		m := 1000 / d
-		if d < 1000 && m > 5 {
+		if d < 1000 && m > 1 {
 			return m * time.Millisecond
 		}
 	}
-	// use the default rate
-	return 5 * time.Millisecond
+	// Use the default rate
+	return amass.DefaultConfig().Frequency
 }

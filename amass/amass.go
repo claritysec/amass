@@ -4,86 +4,134 @@
 package amass
 
 import (
-	"os"
+	"io/ioutil"
+	"net/http"
 	"regexp"
 	"strings"
-	"sync"
 	"time"
 )
 
 const (
 	// Tags used to mark the data source with the Subdomain struct
-	SMART   = "smart"
-	ALT     = "alteration"
+	DNS     = "dns"
+	ALT     = "alt"
 	BRUTE   = "brute"
 	SEARCH  = "search"
 	ARCHIVE = "archive"
 
-	// The default size of the channels within the Amass struct
-	defaultAmassChanSize = 500
-
+	// An IPv4 regular expression
+	IPv4RE = "((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)[.]){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)"
 	// This regular expression + the base domain will match on all names and subdomains
 	SUBRE = "(([a-zA-Z0-9]{1}|[a-zA-Z0-9]{1}[a-zA-Z0-9-]{0,61}[a-zA-Z0-9]{1})[.]{1})+"
+
+	USER_AGENT  = "Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.36"
+	ACCEPT      = "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
+	ACCEPT_LANG = "en-US,en;q=0.8"
+
+	defaultWordlistURL = "https://raw.githubusercontent.com/caffix/amass/master/wordlists/namelist.txt"
 )
 
-// Amass - Contains amass state information
-type Amass struct {
-	// Mutex that protects the structure from concurrent access
-	mtx sync.Mutex
+func StartAmass(config *AmassConfig) error {
+	var resolved []chan *AmassRequest
+	var services []AmassService
 
-	// The channel to send names on for DNS resolution and other processing
-	Names chan *Subdomain
-
-	// The channel that will receive names that have been successfully resolved
-	Resolved chan *Subdomain
-
-	// The open file that contains words to use when generating names
-	Wordlist *os.File
-
-	// Sets the maximum number of DNS queries per minute
-	Frequency time.Duration
-
-	// Holds all the pending DNS name resolutions
-	DNSResolveQueue []*Subdomain
-
-	// The cache of CIDR network blocks that have already been looked up
-	cidrCache map[string]*CIDRData
-}
-
-// Subdomain - Contains information about a subdomain name
-type Subdomain struct {
-	// The discovered subdomain name
-	Name string
-
-	// The base domain that the name belongs to
-	Domain string
-
-	// The IP address that the name resolves to
-	Address string
-
-	// The data source that discovered the name within the amass package
-	Tag string
-}
-
-// NewAmass - Returns an Amass struct initialized with the default configuration
-func NewAmass() *Amass {
-	return NewAmassWithConfig(DefaultConfig())
-}
-
-// NewAmassWithConfig - Returns an Amass struct initialized with a custom configuration
-func NewAmassWithConfig(ac AmassConfig) *Amass {
-	config := customConfig(ac)
-
-	a := &Amass{
-		Names:     make(chan *Subdomain, defaultAmassChanSize),
-		Resolved:  make(chan *Subdomain, defaultAmassChanSize),
-		Wordlist:  config.Wordlist,
-		Frequency: config.Frequency,
-		cidrCache: make(map[string]*CIDRData),
+	if err := CheckConfig(config); err != nil {
+		return err
 	}
-	// Start the go-routine that will process DNS queries at the frequency
-	go a.processDNSRequests()
-	return a
+	// Setup all the channels used by the AmassServices
+	bufSize := 50
+	final := make(chan *AmassRequest, bufSize)
+	ngram := make(chan *AmassRequest, bufSize)
+	brute := make(chan *AmassRequest, bufSize)
+	dns := make(chan *AmassRequest, bufSize)
+	dnsMux := make(chan *AmassRequest, bufSize)
+	netblock := make(chan *AmassRequest, bufSize)
+	netblockMux := make(chan *AmassRequest, bufSize)
+	reverseip := make(chan *AmassRequest, bufSize)
+	archive := make(chan *AmassRequest, bufSize)
+	alt := make(chan *AmassRequest, bufSize)
+	sweep := make(chan *AmassRequest, bufSize)
+	resolved = append(resolved, netblock, archive, alt, brute, ngram)
+	// DNS and Reverse IP need the frequency set
+	config.Frequency *= 2
+	dnsSrv := NewDNSService(dns, dnsMux, config)
+	reverseipSrv := NewReverseIPService(reverseip, dns, config)
+	// Add these service to the slice
+	services = append(services, dnsSrv, reverseipSrv)
+	// Setup the service that jump-start the process
+	searchSrv := NewSubdomainSearchService(nil, dns, config)
+	iphistSrv := NewIPHistoryService(nil, netblock, config)
+	// Add them to the services slice
+	services = append(services, searchSrv, iphistSrv)
+	// These services find more names based on previous findings
+	netblockSrv := NewNetblockService(netblock, netblockMux, config)
+	archiveSrv := NewArchiveService(archive, dns, config)
+	altSrv := NewAlterationService(alt, dns, config)
+	sweepSrv := NewSweepService(sweep, reverseip, config)
+	// Add these service to the slice
+	services = append(services, netblockSrv, archiveSrv, altSrv, sweepSrv)
+	// The brute forcing related services are setup here
+	bruteSrv := NewBruteForceService(brute, dns, config)
+	ngramSrv := NewNgramService(ngram, dns, config)
+	// Add these services to the slice
+	services = append(services, bruteSrv, ngramSrv)
+	// Some service output needs to be sent in multiple directions
+	go requestMultiplexer(dnsMux, resolved...)
+	go requestMultiplexer(netblockMux, sweep, final)
+	// This is the where filtering is performed
+	go finalCheckpoint(final, config.Output)
+	// Start all the services
+	for _, service := range services {
+		service.Start()
+	}
+	// We periodically check if all the services have finished
+	t := time.NewTicker(30 * time.Second)
+	defer t.Stop()
+	for range t.C {
+		done := true
+
+		for _, service := range services {
+			if service.IsActive() {
+				done = false
+				break
+			}
+		}
+
+		if done {
+			break
+		}
+	}
+	// Stop all the services
+	for _, service := range services {
+		service.Stop()
+	}
+	return nil
+}
+
+func requestMultiplexer(in chan *AmassRequest, outs ...chan *AmassRequest) {
+	for req := range in {
+		for _, out := range outs {
+			sendOut(req, out)
+		}
+	}
+}
+
+func finalCheckpoint(in, out chan *AmassRequest) {
+	filter := make(map[string]struct{})
+
+	for req := range in {
+		if _, found := filter[req.Name]; req.Name == "" || found {
+			continue
+		}
+		filter[req.Name] = struct{}{}
+		sendOut(req, out)
+	}
+}
+
+func sendOut(req *AmassRequest, out chan *AmassRequest) {
+	go func() {
+		out <- req
+	}()
 }
 
 // NewUniqueElements - Removes elements that have duplicates in the original or new elements
@@ -128,4 +176,26 @@ func SubdomainRegex(domain string) *regexp.Regexp {
 	d := strings.Replace(domain, ".", "[.]", -1)
 
 	return regexp.MustCompile(SUBRE + d)
+}
+
+func GetWebPage(u string) string {
+	client := &http.Client{}
+
+	req, err := http.NewRequest("GET", u, nil)
+	if err != nil {
+		return ""
+	}
+
+	req.Header.Add("User-Agent", USER_AGENT)
+	req.Header.Add("Accept", ACCEPT)
+	req.Header.Add("Accept-Language", ACCEPT_LANG)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+
+	in, err := ioutil.ReadAll(resp.Body)
+	resp.Body.Close()
+	return string(in)
 }
